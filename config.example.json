@@ -1,0 +1,17 @@
+{
+    "s3_endpoint": "https://s3.twcstorage.ru",
+    "s3_region": "ru-1",
+    "s3_access_key": "ВАШ_ACCESS_KEY",
+    "s3_secret_key": "ВАШ_SECRET_KEY",
+    "s3_bucket": "имя-вашего-бакета",
+    "s3_prefix": "",
+    "watch_folder": "C:\\WatchFolder",
+    "scan_interval_sec": 60,
+    "upload_existing_on_start": false,
+    "file_extensions": [],
+    "ignore_patterns": [".tmp", ".partial", "~$", "Thumbs.db", "desktop.ini"],
+    "max_retries": 3,
+    "retry_delay_sec": 5,
+    "multipart_threshold_mb": 50,
+    "log_level": "INFO"
+}
