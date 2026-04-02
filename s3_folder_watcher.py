@@ -566,12 +566,160 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────
+# Автоустановка службы
+# ─────────────────────────────────────────────
+def is_admin() -> bool:
+    """Проверяет, запущен ли процесс с правами администратора."""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def run_as_admin():
+    """Перезапускает текущий процесс с правами администратора."""
+    import ctypes
+    if getattr(sys, 'frozen', False):
+        exe = sys.executable
+    else:
+        exe = sys.executable
+    params = " ".join([f'"{a}"' for a in sys.argv])
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+
+
+def is_service_installed(service_name: str) -> bool:
+    """Проверяет, установлена ли служба."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["sc", "query", service_name],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def is_service_running(service_name: str) -> bool:
+    """Проверяет, запущена ли служба."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["sc", "query", service_name],
+            capture_output=True, text=True
+        )
+        return "RUNNING" in result.stdout
+    except Exception:
+        return False
+
+
+def auto_install_and_start():
+    """Автоматически устанавливает и запускает службу Windows."""
+    service_name = "S3FolderWatcher"
+
+    if not is_admin():
+        print("Для установки службы требуются права администратора.")
+        print("Запрашиваю повышение прав...")
+        run_as_admin()
+        sys.exit(0)
+
+    import subprocess
+
+    if is_service_installed(service_name):
+        print(f"Служба '{service_name}' уже установлена.")
+        # Обновляем на случай, если exe переместили
+        subprocess.run(
+            ["sc", "config", service_name, "binPath=",
+             f'"{sys.executable}" --service'],
+            capture_output=True
+        )
+        # Устанавливаем автозапуск
+        subprocess.run(
+            ["sc", "config", service_name, "start=", "auto"],
+            capture_output=True
+        )
+        if not is_service_running(service_name):
+            print("Запускаю службу...")
+            subprocess.run(["sc", "start", service_name], capture_output=True)
+            time.sleep(2)
+            if is_service_running(service_name):
+                print(f"✓ Служба '{service_name}' запущена!")
+            else:
+                print(f"✗ Не удалось запустить службу. Проверьте журнал: {LOG_PATH}")
+        else:
+            print(f"✓ Служба '{service_name}' уже работает.")
+    else:
+        print(f"Установка службы '{service_name}'...")
+
+        # Регистрируем службу через sc create
+        exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+        result = subprocess.run(
+            ["sc", "create", service_name,
+             "binPath=", f'"{exe_path}" --service',
+             "DisplayName=", "S3 Folder Watcher (Timeweb Cloud)",
+             "start=", "auto"],
+            capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            print(f"✗ Ошибка установки: {result.stderr.strip()}")
+            input("Нажмите Enter для выхода...")
+            sys.exit(1)
+
+        # Устанавливаем описание
+        subprocess.run(
+            ["sc", "description", service_name,
+             "Следит за папкой и автоматически загружает файлы в S3-хранилище Timeweb Cloud."],
+            capture_output=True
+        )
+
+        # Настраиваем автоперезапуск при сбое (через 10 секунд)
+        subprocess.run(
+            ["sc", "failure", service_name,
+             "reset=", "86400", "actions=", "restart/10000/restart/10000/restart/30000"],
+            capture_output=True
+        )
+
+        print(f"✓ Служба '{service_name}' установлена (автозапуск).")
+        print("Запускаю службу...")
+
+        subprocess.run(["sc", "start", service_name], capture_output=True)
+        time.sleep(2)
+
+        if is_service_running(service_name):
+            print(f"✓ Служба '{service_name}' успешно запущена!")
+        else:
+            print(f"✗ Не удалось запустить. Проверьте журнал: {LOG_PATH}")
+
+    print()
+    print(f"  Папка наблюдения: {load_config()['watch_folder']}")
+    print(f"  Лог-файл:        {LOG_PATH}")
+    print(f"  Конфигурация:     {CONFIG_PATH}")
+    print()
+    print("  Управление:")
+    print(f'    sc stop {service_name}     — остановить')
+    print(f'    sc start {service_name}    — запустить')
+    print(f'    sc delete {service_name}   — удалить')
+    print()
+    input("Нажмите Enter для выхода...")
+
+
+# ─────────────────────────────────────────────
 # Точка входа
 # ─────────────────────────────────────────────
 def main():
-    cfg = load_config()
+    # Режим службы Windows (вызывается SCM)
+    if "--service" in sys.argv:
+        if not HAS_WIN32:
+            print("pywin32 не найден!")
+            sys.exit(1)
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(S3WatcherService)
+        servicemanager.StartServiceCtrlDispatcher()
+        return
 
-    # Если передан аргумент для управления службой Windows
+    # Ручное управление службой (install/remove/start/stop)
     if len(sys.argv) > 1 and sys.argv[1] in (
         "install", "remove", "start", "stop", "restart", "update", "debug"
     ):
@@ -580,9 +728,16 @@ def main():
             print("  pip install pywin32")
             sys.exit(1)
         win32serviceutil.HandleCommandLine(S3WatcherService)
-    else:
-        # Обычный режим (консольный)
+        return
+
+    # Режим консоли (--console)
+    if "--console" in sys.argv:
+        cfg = load_config()
         run_watcher(cfg)
+        return
+
+    # По умолчанию: автоустановка и запуск службы
+    auto_install_and_start()
 
 
 if __name__ == "__main__":
