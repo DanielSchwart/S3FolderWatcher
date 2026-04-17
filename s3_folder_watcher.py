@@ -45,7 +45,8 @@ DEFAULT_CONFIG = {
     "s3_bucket": "",
     "s3_prefix": "",
     "watch_folder": r"C:\WatchFolder",
-    "scan_interval_sec": 60,
+    "scan_schedule": ["03:00"],
+    "scan_interval_sec": 0,
     "upload_existing_on_start": False,
     "file_extensions": [],
     "ignore_patterns": [".tmp", ".partial", "~$", "Thumbs.db", "desktop.ini"],
@@ -433,7 +434,7 @@ def create_watcher(cfg: dict, logger: logging.Logger) -> Observer:
 
 
 # ─────────────────────────────────────────────
-# Периодическое сканирование (подстраховка)
+# Интервальное сканирование (подстраховка)
 # ─────────────────────────────────────────────
 def periodic_scan(interval: int, watch_folder: str, uploader: S3Uploader,
                   state: UploadState, cfg: dict, logger: logging.Logger):
@@ -444,6 +445,55 @@ def periodic_scan(interval: int, watch_folder: str, uploader: S3Uploader,
             scan_existing_files(watch_folder, uploader, state, cfg, logger)
         except Exception as e:
             logger.warning(f"Ошибка при периодическом сканировании: {e}")
+
+
+# ─────────────────────────────────────────────
+# Сканирование по расписанию
+# ─────────────────────────────────────────────
+def parse_schedule(schedule_list: list, logger: logging.Logger) -> list:
+    """Парсит список времён из конфига. Формат: ['03:00', '14:30']."""
+    parsed = []
+    for item in schedule_list:
+        try:
+            parts = item.strip().split(":")
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                parsed.append((hour, minute))
+            else:
+                logger.warning(f"Некорректное время в расписании: {item}")
+        except (ValueError, IndexError):
+            logger.warning(f"Не удалось разобрать время: {item}")
+    return sorted(parsed)
+
+
+def scheduled_scan(schedule: list, watch_folder: str, uploader: S3Uploader,
+                   state: UploadState, cfg: dict, logger: logging.Logger):
+    """Запускает сканирование в заданное время (по расписанию)."""
+    triggered_today = set()
+
+    while True:
+        now = datetime.now()
+        current_time = (now.hour, now.minute)
+        today = now.date()
+
+        for scheduled_time in schedule:
+            key = (today, scheduled_time)
+            if current_time == scheduled_time and key not in triggered_today:
+                triggered_today.add(key)
+                logger.info(
+                    f"Запланированное сканирование ({scheduled_time[0]:02d}:"
+                    f"{scheduled_time[1]:02d})..."
+                )
+                try:
+                    scan_existing_files(watch_folder, uploader, state, cfg, logger)
+                except Exception as e:
+                    logger.warning(f"Ошибка при сканировании по расписанию: {e}")
+
+        # Очищаем старые записи (при переходе на новый день)
+        triggered_today = {k for k in triggered_today if k[0] == today}
+
+        time.sleep(30)
 
 
 # ─────────────────────────────────────────────
@@ -463,16 +513,28 @@ def run_watcher(cfg: dict):
     observer, uploader, state = create_watcher(cfg, logger)
     observer.start()
 
-    # Периодическое сканирование (подстраховка watchdog)
+    # Интервальное сканирование
     scan_interval = cfg.get("scan_interval_sec", 0)
     if scan_interval > 0:
-        scanner = threading.Thread(
+        threading.Thread(
             target=periodic_scan,
             args=(scan_interval, cfg["watch_folder"], uploader, state, cfg, logger),
             daemon=True,
-        )
-        scanner.start()
-        logger.info(f"Периодическое сканирование каждые {scan_interval} сек.")
+        ).start()
+        logger.info(f"Интервальное сканирование каждые {scan_interval} сек.")
+
+    # Сканирование по расписанию
+    schedule_list = cfg.get("scan_schedule", [])
+    if schedule_list:
+        schedule = parse_schedule(schedule_list, logger)
+        if schedule:
+            threading.Thread(
+                target=scheduled_scan,
+                args=(schedule, cfg["watch_folder"], uploader, state, cfg, logger),
+                daemon=True,
+            ).start()
+            times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in schedule)
+            logger.info(f"Сканирование по расписанию: {times_str}")
 
     logger.info("Наблюдение запущено. Ожидание новых файлов...")
     logger.info("Для остановки нажмите Ctrl+C")
@@ -537,15 +599,25 @@ try:
 
             observer.start()
 
-            # Периодическое сканирование
+            # Интервальное сканирование
             scan_interval = cfg.get("scan_interval_sec", 0)
             if scan_interval > 0:
-                scanner = threading.Thread(
+                threading.Thread(
                     target=periodic_scan,
                     args=(scan_interval, cfg["watch_folder"], uploader, state, cfg, logger),
                     daemon=True,
-                )
-                scanner.start()
+                ).start()
+
+            # Сканирование по расписанию
+            schedule_list = cfg.get("scan_schedule", [])
+            if schedule_list:
+                schedule = parse_schedule(schedule_list, logger)
+                if schedule:
+                    threading.Thread(
+                        target=scheduled_scan,
+                        args=(schedule, cfg["watch_folder"], uploader, state, cfg, logger),
+                        daemon=True,
+                    ).start()
 
             logger.info("Наблюдение за папкой запущено (режим службы)")
 
