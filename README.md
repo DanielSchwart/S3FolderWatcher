@@ -230,4 +230,8 @@ pyinstaller --onefile --name S3FolderWatcher --icon=app_icon.ico --console --cle
 
 ## Лицензия
 
-MIT
+Проект распространяется под лицензией [MIT](LICENSE).
+
+```
+Copyright (c) 2026 DanielSchwart
+```
