@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Сборка PyInstaller
+build/
+dist/
+*.spec
+
+# Рабочие файлы программы (секреты, состояние, логи)
+config.json
+upload_state.json
+upload_state.tmp
+*.log
+*.log.*

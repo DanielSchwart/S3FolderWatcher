@@ -10,7 +10,7 @@
     "scan_interval_sec": 0,
     "upload_existing_on_start": false,
     "file_extensions": [],
-    "ignore_patterns": [".tmp", ".partial", "~$", "Thumbs.db", "desktop.ini"],
+    "ignore_patterns": ["*.tmp", "*.partial", "~$*", "Thumbs.db", "desktop.ini"],
     "max_retries": 3,
     "retry_delay_sec": 5,
     "multipart_threshold_mb": 50,

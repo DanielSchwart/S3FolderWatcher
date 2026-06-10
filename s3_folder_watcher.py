@@ -10,12 +10,15 @@ import os
 import sys
 import time
 import json
+import fnmatch
 import logging
 import hashlib
 import threading
 import queue
+from collections import namedtuple
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import boto3
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -49,7 +52,7 @@ DEFAULT_CONFIG = {
     "scan_interval_sec": 0,
     "upload_existing_on_start": False,
     "file_extensions": [],
-    "ignore_patterns": [".tmp", ".partial", "~$", "Thumbs.db", "desktop.ini"],
+    "ignore_patterns": ["*.tmp", "*.partial", "~$*", "Thumbs.db", "desktop.ini"],
     "max_retries": 3,
     "retry_delay_sec": 5,
     "multipart_threshold_mb": 50,
@@ -69,23 +72,25 @@ def setup_logging(level_name: str = "INFO"):
 
     logger.setLevel(level)
 
-    # Файл
-    fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    fh.setLevel(level)
-
-    # Консоль (для отладки)
-    ch = logging.StreamHandler()
-    ch.setLevel(level)
-
     fmt = logging.Formatter(
         "[%(asctime)s] %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-    fh.setFormatter(fmt)
-    ch.setFormatter(fmt)
 
+    # Файл с ротацией (5 МБ × 3 архива)
+    fh = RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
-    logger.addHandler(ch)
+
+    # Консоль (в режиме Windows-службы stdout отсутствует)
+    if sys.stdout is not None:
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
     return logger
 
@@ -93,9 +98,11 @@ def setup_logging(level_name: str = "INFO"):
 # ─────────────────────────────────────────────
 # Конфигурация
 # ─────────────────────────────────────────────
-def load_config() -> dict:
+def load_config(create_if_missing: bool = True) -> dict:
     """Загружает конфигурацию из JSON-файла. Если файла нет — создаёт шаблон."""
     if not CONFIG_PATH.exists():
+        if not create_if_missing:
+            raise FileNotFoundError(f"Файл конфигурации не найден: {CONFIG_PATH}")
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, indent=4, ensure_ascii=False)
         print(f"[!] Создан файл конфигурации: {CONFIG_PATH}")
@@ -117,6 +124,18 @@ def load_config() -> dict:
     return cfg
 
 
+def validate_config(cfg: dict) -> list:
+    """Возвращает список ошибок конфигурации (пустой список — всё в порядке)."""
+    errors = []
+    for key in ("s3_access_key", "s3_secret_key", "s3_bucket"):
+        value = str(cfg.get(key) or "")
+        if not value or value.startswith("ВАШ_") or value == "имя-вашего-бакета":
+            errors.append(f"Не заполнен параметр '{key}' в config.json")
+    if not str(cfg.get("s3_endpoint", "")).startswith(("http://", "https://")):
+        errors.append("Параметр 's3_endpoint' должен начинаться с http:// или https://")
+    return errors
+
+
 # ─────────────────────────────────────────────
 # Общая функция фильтрации файлов
 # ─────────────────────────────────────────────
@@ -124,7 +143,12 @@ def should_ignore(filepath: str, cfg: dict) -> bool:
     """Проверяет, нужно ли игнорировать файл."""
     basename = os.path.basename(filepath)
     for pattern in cfg.get("ignore_patterns", []):
-        if pattern in basename:
+        if any(ch in pattern for ch in "*?["):
+            # Glob-паттерн: "*.tmp", "~$*" и т.п.
+            if fnmatch.fnmatch(basename, pattern):
+                return True
+        elif pattern in basename:
+            # Простая подстрока (обратная совместимость со старыми конфигами)
             return True
 
     extensions = cfg.get("file_extensions", [])
@@ -140,7 +164,8 @@ def should_ignore(filepath: str, cfg: dict) -> bool:
 # Состояние загрузок (какие файлы уже загружены)
 # ─────────────────────────────────────────────
 class UploadState:
-    """Хранит MD5-хеши загруженных файлов для предотвращения дублей."""
+    """Хранит метаданные (хеш, размер, mtime) загруженных файлов
+    для предотвращения повторных загрузок."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -173,18 +198,49 @@ class UploadState:
         return h.hexdigest()
 
     def needs_upload(self, filepath: str) -> tuple:
-        """Проверяет, изменился ли файл. Возвращает (needs_upload, hash)."""
+        """Проверяет, изменился ли файл. Возвращает (needs_upload, meta)."""
+        try:
+            st = os.stat(filepath)
+        except OSError:
+            return False, None
+
+        entry = self.data.get(filepath)
+        if isinstance(entry, str):
+            # Старый формат состояния: хранился только хеш
+            entry = {"hash": entry, "size": None, "mtime": None}
+
+        # Быстрая проверка: размер и mtime не менялись — хеш не пересчитываем
+        if entry and entry.get("size") == st.st_size and entry.get("mtime") == st.st_mtime:
+            return False, entry
+
         try:
             current_hash = self.file_hash(filepath)
-        except (IOError, OSError):
+        except OSError:
             return False, None
-        return self.data.get(filepath) != current_hash, current_hash
 
-    def mark_uploaded(self, filepath: str, file_hash: str):
+        meta = {"hash": current_hash, "size": st.st_size, "mtime": st.st_mtime}
+        if entry and entry.get("hash") == current_hash:
+            # Содержимое не изменилось — обновляем метаданные без загрузки
+            self.mark_uploaded(filepath, meta)
+            return False, meta
+
+        return True, meta
+
+    def mark_uploaded(self, filepath: str, meta: dict):
         """Помечает файл как загруженный."""
         with self._lock:
-            self.data[filepath] = file_hash
+            self.data[filepath] = meta
             self.save()
+
+    def prune_missing(self) -> int:
+        """Удаляет записи о файлах, которых больше нет на диске."""
+        with self._lock:
+            missing = [p for p in self.data if not os.path.exists(p)]
+            for p in missing:
+                del self.data[p]
+            if missing:
+                self.save()
+        return len(missing)
 
 
 # ─────────────────────────────────────────────
@@ -262,6 +318,8 @@ class S3Uploader:
                 self.log.info(f"  ✓ Загружен: {s3_key}")
                 return True
 
+            except EndpointConnectionError:
+                self.log.warning(f"  ✗ Нет соединения с {self.cfg['s3_endpoint']}")
             except ClientError as e:
                 self.log.warning(f"  ✗ Ошибка S3: {e}")
             except (IOError, OSError) as e:
@@ -286,16 +344,57 @@ class S3Uploader:
 
 
 # ─────────────────────────────────────────────
+# Дедупликация одновременных загрузок
+# ─────────────────────────────────────────────
+class InFlightTracker:
+    """Не даёт нескольким потокам одновременно загружать один и тот же файл."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._paths: set = set()
+
+    def acquire(self, path: str) -> bool:
+        with self._lock:
+            if path in self._paths:
+                return False
+            self._paths.add(path)
+            return True
+
+    def release(self, path: str):
+        with self._lock:
+            self._paths.discard(path)
+
+
+def try_upload_path(path: str, uploader: S3Uploader, state: UploadState,
+                    cfg: dict, in_flight: InFlightTracker) -> bool:
+    """Единая точка загрузки файла: дедупликация, проверка изменений, загрузка."""
+    if not in_flight.acquire(path):
+        return False
+    try:
+        needs, meta = state.needs_upload(path)
+        if not needs:
+            return False
+        if uploader.upload_file(path, cfg["watch_folder"]):
+            state.mark_uploaded(path, meta)
+            return True
+        return False
+    finally:
+        in_flight.release(path)
+
+
+# ─────────────────────────────────────────────
 # Обработчик событий файловой системы
 # ─────────────────────────────────────────────
 class FolderEventHandler(FileSystemEventHandler):
     def __init__(self, uploader: S3Uploader, state: UploadState,
-                 cfg: dict, logger: logging.Logger):
+                 cfg: dict, logger: logging.Logger, in_flight: InFlightTracker):
         super().__init__()
         self.uploader = uploader
         self.state = state
         self.cfg = cfg
         self.log = logger
+        self.in_flight = in_flight
+        self._stop = threading.Event()
         self._debounce_sec = 2.0
         # Очередь + один рабочий поток вместо множества Timer-ов
         self._pending: dict[str, float] = {}
@@ -304,9 +403,14 @@ class FolderEventHandler(FileSystemEventHandler):
         self._worker = threading.Thread(target=self._upload_worker, daemon=True)
         self._worker.start()
 
+    def stop(self, timeout: float = 30.0):
+        """Останавливает рабочий поток, дождавшись завершения текущей загрузки."""
+        self._stop.set()
+        self._worker.join(timeout=timeout)
+
     def _upload_worker(self):
         """Единый рабочий поток для обработки файлов с debounce."""
-        while True:
+        while not self._stop.is_set():
             # Собираем новые события из очереди
             try:
                 path = self._queue.get(timeout=self._debounce_sec / 2)
@@ -346,25 +450,27 @@ class FolderEventHandler(FileSystemEventHandler):
             self.log.debug(f"Файл ещё занят: {path}, отложим...")
             time.sleep(1)
             if not self._is_file_ready(path):
+                self.log.debug(f"Файл всё ещё занят: {path}, будет загружен при сканировании")
                 return
 
-        needs, file_hash = self.state.needs_upload(path)
-        if not needs:
-            return
-
-        watch_folder = self.cfg["watch_folder"]
-        success = self.uploader.upload_file(path, watch_folder)
-        if success:
-            self.state.mark_uploaded(path, file_hash)
+        try_upload_path(path, self.uploader, self.state, self.cfg, self.in_flight)
 
     @staticmethod
     def _is_file_ready(path: str) -> bool:
-        """Проверяет, что файл доступен для чтения (не заблокирован)."""
+        """Проверяет, что файл доступен и не занят другим процессом."""
         try:
             with open(path, "rb"):
-                return True
+                pass
         except (IOError, PermissionError):
             return False
+        if os.name == "nt":
+            # На Windows переименование файла в самого себя не удаётся,
+            # пока он открыт другим процессом (например, идёт копирование)
+            try:
+                os.replace(path, path)
+            except OSError:
+                return False
+        return True
 
     def on_created(self, event):
         if not event.is_directory:
@@ -385,33 +491,49 @@ class FolderEventHandler(FileSystemEventHandler):
 # ─────────────────────────────────────────────
 # Сканер существующих файлов
 # ─────────────────────────────────────────────
+_scan_lock = threading.Lock()
+
+
 def scan_existing_files(watch_folder: str, uploader: S3Uploader,
-                        state: UploadState, cfg: dict, logger: logging.Logger):
+                        state: UploadState, cfg: dict, logger: logging.Logger,
+                        in_flight: InFlightTracker):
     """Сканирует папку и загружает файлы, которые ещё не были загружены."""
-    logger.info(f"Сканирование существующих файлов в: {watch_folder}")
-    count = 0
+    if not _scan_lock.acquire(blocking=False):
+        logger.info("Сканирование уже выполняется — пропуск.")
+        return
+    try:
+        logger.info(f"Сканирование существующих файлов в: {watch_folder}")
+        count = 0
 
-    for root, dirs, files in os.walk(watch_folder):
-        for filename in files:
-            filepath = os.path.join(root, filename)
+        for root, dirs, files in os.walk(watch_folder):
+            for filename in files:
+                filepath = os.path.join(root, filename)
 
-            if should_ignore(filepath, cfg):
-                continue
+                if should_ignore(filepath, cfg):
+                    continue
 
-            needs, file_hash = state.needs_upload(filepath)
-            if needs:
-                if uploader.upload_file(filepath, watch_folder):
-                    state.mark_uploaded(filepath, file_hash)
+                if try_upload_path(filepath, uploader, state, cfg, in_flight):
                     count += 1
 
-    logger.info(f"Сканирование завершено. Загружено файлов: {count}")
+        pruned = state.prune_missing()
+        if pruned:
+            logger.info(f"Удалено записей об отсутствующих файлах: {pruned}")
+
+        logger.info(f"Сканирование завершено. Загружено файлов: {count}")
+    finally:
+        _scan_lock.release()
 
 
 # ─────────────────────────────────────────────
 # Общая логика инициализации watcher
 # ─────────────────────────────────────────────
-def create_watcher(cfg: dict, logger: logging.Logger) -> Observer:
-    """Создаёт и возвращает настроенный Observer, готовый к запуску."""
+WatcherParts = namedtuple(
+    "WatcherParts", ["observer", "handler", "uploader", "state", "in_flight"]
+)
+
+
+def create_watcher(cfg: dict, logger: logging.Logger) -> WatcherParts:
+    """Создаёт и возвращает настроенный Observer и сопутствующие объекты."""
     watch_folder = cfg["watch_folder"]
     if not os.path.isdir(watch_folder):
         logger.info(f"Создание папки для наблюдения: {watch_folder}")
@@ -422,27 +544,29 @@ def create_watcher(cfg: dict, logger: logging.Logger) -> Observer:
         raise RuntimeError("Не удалось подключиться к S3. Проверьте config.json")
 
     state = UploadState(STATE_PATH)
+    in_flight = InFlightTracker()
 
     if cfg.get("upload_existing_on_start", False):
-        scan_existing_files(watch_folder, uploader, state, cfg, logger)
+        scan_existing_files(watch_folder, uploader, state, cfg, logger, in_flight)
 
-    handler = FolderEventHandler(uploader, state, cfg, logger)
+    handler = FolderEventHandler(uploader, state, cfg, logger, in_flight)
     observer = Observer()
     observer.schedule(handler, watch_folder, recursive=True)
 
-    return observer, uploader, state
+    return WatcherParts(observer, handler, uploader, state, in_flight)
 
 
 # ─────────────────────────────────────────────
 # Интервальное сканирование (подстраховка)
 # ─────────────────────────────────────────────
 def periodic_scan(interval: int, watch_folder: str, uploader: S3Uploader,
-                  state: UploadState, cfg: dict, logger: logging.Logger):
+                  state: UploadState, cfg: dict, logger: logging.Logger,
+                  in_flight: InFlightTracker):
     """Периодически сканирует папку для подстраховки (watchdog может пропустить события)."""
     while True:
         time.sleep(interval)
         try:
-            scan_existing_files(watch_folder, uploader, state, cfg, logger)
+            scan_existing_files(watch_folder, uploader, state, cfg, logger, in_flight)
         except Exception as e:
             logger.warning(f"Ошибка при периодическом сканировании: {e}")
 
@@ -467,33 +591,69 @@ def parse_schedule(schedule_list: list, logger: logging.Logger) -> list:
     return sorted(parsed)
 
 
+def next_run_time(schedule: list, after: datetime) -> datetime:
+    """Возвращает ближайший момент запуска из расписания после момента `after`."""
+    candidates = []
+    for hour, minute in schedule:
+        candidate = after.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= after:
+            candidate += timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates)
+
+
 def scheduled_scan(schedule: list, watch_folder: str, uploader: S3Uploader,
-                   state: UploadState, cfg: dict, logger: logging.Logger):
-    """Запускает сканирование в заданное время (по расписанию)."""
-    triggered_today = set()
+                   state: UploadState, cfg: dict, logger: logging.Logger,
+                   in_flight: InFlightTracker):
+    """Запускает сканирование в заданное время. Если момент был пропущен
+    (сон системы, долгое предыдущее сканирование) — выполняет его при
+    первой возможности."""
+    next_run = next_run_time(schedule, datetime.now())
+    logger.info(f"Следующее сканирование по расписанию: {next_run:%Y-%m-%d %H:%M}")
 
     while True:
-        now = datetime.now()
-        current_time = (now.hour, now.minute)
-        today = now.date()
+        time.sleep(20)
+        if datetime.now() < next_run:
+            continue
 
-        for scheduled_time in schedule:
-            key = (today, scheduled_time)
-            if current_time == scheduled_time and key not in triggered_today:
-                triggered_today.add(key)
-                logger.info(
-                    f"Запланированное сканирование ({scheduled_time[0]:02d}:"
-                    f"{scheduled_time[1]:02d})..."
-                )
-                try:
-                    scan_existing_files(watch_folder, uploader, state, cfg, logger)
-                except Exception as e:
-                    logger.warning(f"Ошибка при сканировании по расписанию: {e}")
+        logger.info(f"Запланированное сканирование ({next_run:%H:%M})...")
+        try:
+            scan_existing_files(watch_folder, uploader, state, cfg, logger, in_flight)
+        except Exception as e:
+            logger.warning(f"Ошибка при сканировании по расписанию: {e}")
 
-        # Очищаем старые записи (при переходе на новый день)
-        triggered_today = {k for k in triggered_today if k[0] == today}
+        next_run = next_run_time(schedule, datetime.now())
+        logger.info(f"Следующее сканирование по расписанию: {next_run:%Y-%m-%d %H:%M}")
 
-        time.sleep(30)
+
+# ─────────────────────────────────────────────
+# Запуск фоновых сканирований (общий для консоли и службы)
+# ─────────────────────────────────────────────
+def start_background_scans(cfg: dict, uploader: S3Uploader, state: UploadState,
+                           logger: logging.Logger, in_flight: InFlightTracker):
+    """Запускает потоки интервального и планового сканирования (если включены)."""
+    scan_interval = cfg.get("scan_interval_sec", 0)
+    if scan_interval > 0:
+        threading.Thread(
+            target=periodic_scan,
+            args=(scan_interval, cfg["watch_folder"], uploader, state, cfg,
+                  logger, in_flight),
+            daemon=True,
+        ).start()
+        logger.info(f"Интервальное сканирование каждые {scan_interval} сек.")
+
+    schedule_list = cfg.get("scan_schedule", [])
+    if schedule_list:
+        schedule = parse_schedule(schedule_list, logger)
+        if schedule:
+            threading.Thread(
+                target=scheduled_scan,
+                args=(schedule, cfg["watch_folder"], uploader, state, cfg,
+                      logger, in_flight),
+                daemon=True,
+            ).start()
+            times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in schedule)
+            logger.info(f"Сканирование по расписанию: {times_str}")
 
 
 # ─────────────────────────────────────────────
@@ -503,6 +663,13 @@ def run_watcher(cfg: dict):
     """Запускает наблюдатель за папкой."""
     logger = setup_logging(cfg.get("log_level", "INFO"))
 
+    errors = validate_config(cfg)
+    if errors:
+        for err in errors:
+            logger.error(err)
+        logger.error("Исправьте config.json и запустите программу снова.")
+        sys.exit(1)
+
     logger.info("=" * 60)
     logger.info("  S3 Folder Watcher — Timeweb Cloud")
     logger.info(f"  Endpoint:  {cfg['s3_endpoint']}")
@@ -510,31 +677,10 @@ def run_watcher(cfg: dict):
     logger.info(f"  Папка:     {cfg['watch_folder']}")
     logger.info("=" * 60)
 
-    observer, uploader, state = create_watcher(cfg, logger)
-    observer.start()
+    parts = create_watcher(cfg, logger)
+    parts.observer.start()
 
-    # Интервальное сканирование
-    scan_interval = cfg.get("scan_interval_sec", 0)
-    if scan_interval > 0:
-        threading.Thread(
-            target=periodic_scan,
-            args=(scan_interval, cfg["watch_folder"], uploader, state, cfg, logger),
-            daemon=True,
-        ).start()
-        logger.info(f"Интервальное сканирование каждые {scan_interval} сек.")
-
-    # Сканирование по расписанию
-    schedule_list = cfg.get("scan_schedule", [])
-    if schedule_list:
-        schedule = parse_schedule(schedule_list, logger)
-        if schedule:
-            threading.Thread(
-                target=scheduled_scan,
-                args=(schedule, cfg["watch_folder"], uploader, state, cfg, logger),
-                daemon=True,
-            ).start()
-            times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in schedule)
-            logger.info(f"Сканирование по расписанию: {times_str}")
+    start_background_scans(cfg, parts.uploader, parts.state, logger, parts.in_flight)
 
     logger.info("Наблюдение запущено. Ожидание новых файлов...")
     logger.info("Для остановки нажмите Ctrl+C")
@@ -544,9 +690,10 @@ def run_watcher(cfg: dict):
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Получен сигнал остановки...")
-        observer.stop()
 
-    observer.join()
+    parts.observer.stop()
+    parts.observer.join()
+    parts.handler.stop()
     logger.info("Служба остановлена.")
 
 
@@ -586,38 +733,34 @@ try:
             self.main()
 
         def main(self):
-            cfg = load_config()
+            try:
+                cfg = load_config(create_if_missing=False)
+            except FileNotFoundError as e:
+                servicemanager.LogErrorMsg(str(e))
+                return
+
             logger = setup_logging(cfg.get("log_level", "INFO"))
+
+            errors = validate_config(cfg)
+            if errors:
+                for err in errors:
+                    logger.error(err)
+                servicemanager.LogErrorMsg(
+                    "Некорректная конфигурация. Подробности в " + str(LOG_PATH)
+                )
+                return
 
             logger.info("Windows-служба S3 Folder Watcher запущена")
 
             try:
-                observer, uploader, state = create_watcher(cfg, logger)
+                parts = create_watcher(cfg, logger)
             except RuntimeError as e:
                 logger.error(str(e))
                 return
 
-            observer.start()
-
-            # Интервальное сканирование
-            scan_interval = cfg.get("scan_interval_sec", 0)
-            if scan_interval > 0:
-                threading.Thread(
-                    target=periodic_scan,
-                    args=(scan_interval, cfg["watch_folder"], uploader, state, cfg, logger),
-                    daemon=True,
-                ).start()
-
-            # Сканирование по расписанию
-            schedule_list = cfg.get("scan_schedule", [])
-            if schedule_list:
-                schedule = parse_schedule(schedule_list, logger)
-                if schedule:
-                    threading.Thread(
-                        target=scheduled_scan,
-                        args=(schedule, cfg["watch_folder"], uploader, state, cfg, logger),
-                        daemon=True,
-                    ).start()
+            parts.observer.start()
+            start_background_scans(cfg, parts.uploader, parts.state,
+                                   logger, parts.in_flight)
 
             logger.info("Наблюдение за папкой запущено (режим службы)")
 
@@ -627,8 +770,9 @@ try:
                 if rc == win32event.WAIT_OBJECT_0:
                     break
 
-            observer.stop()
-            observer.join()
+            parts.observer.stop()
+            parts.observer.join()
+            parts.handler.stop()
             logger.info("Служба остановлена.")
 
     HAS_WIN32 = True
@@ -653,11 +797,21 @@ def run_as_admin():
     """Перезапускает текущий процесс с правами администратора."""
     import ctypes
     if getattr(sys, 'frozen', False):
-        exe = sys.executable
+        # EXE запускает сам себя — argv[0] (путь к exe) в параметрах не нужен
+        args = sys.argv[1:]
     else:
-        exe = sys.executable
-    params = " ".join([f'"{a}"' for a in sys.argv])
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        # python.exe + путь к скрипту + аргументы
+        args = sys.argv
+    params = " ".join(f'"{a}"' for a in args)
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+
+
+def get_service_command() -> str:
+    """Команда запуска службы для SCM (binPath)."""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}" --service'
+    script = os.path.abspath(sys.argv[0])
+    return f'"{sys.executable}" "{script}" --service'
 
 
 def is_service_installed(service_name: str) -> bool:
@@ -690,6 +844,17 @@ def auto_install_and_start():
     """Автоматически устанавливает и запускает службу Windows."""
     service_name = "S3FolderWatcher"
 
+    # Конфигурацию проверяем ДО установки службы: если файла нет,
+    # load_config создаст шаблон и завершит работу с подсказкой
+    cfg = load_config()
+    errors = validate_config(cfg)
+    if errors:
+        for err in errors:
+            print(f"[!] {err}")
+        print("Отредактируйте config.json и запустите программу снова.")
+        input("Нажмите Enter для выхода...")
+        sys.exit(1)
+
     if not is_admin():
         print("Для установки службы требуются права администратора.")
         print("Запрашиваю повышение прав...")
@@ -702,8 +867,7 @@ def auto_install_and_start():
         print(f"Служба '{service_name}' уже установлена.")
         # Обновляем на случай, если exe переместили
         subprocess.run(
-            ["sc", "config", service_name, "binPath=",
-             f'"{sys.executable}" --service'],
+            ["sc", "config", service_name, "binPath=", get_service_command()],
             capture_output=True
         )
         # Устанавливаем автозапуск
@@ -725,10 +889,9 @@ def auto_install_and_start():
         print(f"Установка службы '{service_name}'...")
 
         # Регистрируем службу через sc create
-        exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
         result = subprocess.run(
             ["sc", "create", service_name,
-             "binPath=", f'"{exe_path}" --service',
+             "binPath=", get_service_command(),
              "DisplayName=", "S3 Folder Watcher (Timeweb Cloud)",
              "start=", "auto"],
             capture_output=True, text=True
@@ -765,7 +928,7 @@ def auto_install_and_start():
             print(f"✗ Не удалось запустить. Проверьте журнал: {LOG_PATH}")
 
     print()
-    print(f"  Папка наблюдения: {load_config()['watch_folder']}")
+    print(f"  Папка наблюдения: {cfg['watch_folder']}")
     print(f"  Лог-файл:        {LOG_PATH}")
     print(f"  Конфигурация:     {CONFIG_PATH}")
     print()
